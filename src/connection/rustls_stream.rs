@@ -31,14 +31,9 @@ static CONFIG: std::sync::LazyLock<Arc<ClientConfig>> = std::sync::LazyLock::new
 
     #[cfg(feature = "rustls-webpki")]
     {
-        root_certificates.add_parsable_certificates(
-            webpki_roots::TLS_SERVER_ROOTS
-                .iter()
-                .map(|ta| ta.der)
-        );
+        root_certificates.extend(TLS_SERVER_ROOTS.iter().cloned());
     }
-
-    // ClientConfig builder API changed - no more with_safe_defaults()
+    
     let config = ClientConfig::builder()
         .with_root_certificates(root_certificates)
         .with_no_client_auth();
