@@ -31,16 +31,14 @@ static CONFIG: std::sync::LazyLock<Arc<ClientConfig>> = std::sync::LazyLock::new
 
     #[cfg(feature = "rustls-webpki")]
     {
-        for ta in TLS_SERVER_ROOTS {
-            let trust_anchor = rustls::pki_types::TrustAnchor {
-                subject: ta.subject,
-                subject_public_key_info: ta.subject_public_key_info,
-                name_constraints: ta.name_constraints,
-            };
-            root_certificates.add_trust_anchors([trust_anchor]);
-        }
+        root_certificates.add_parsable_certificates(
+            webpki_roots::TLS_SERVER_ROOTS
+                .iter()
+                .map(|ta| ta.der)
+        );
     }
-    
+
+    // ClientConfig builder API changed - no more with_safe_defaults()
     let config = ClientConfig::builder()
         .with_root_certificates(root_certificates)
         .with_no_client_auth();
@@ -48,21 +46,24 @@ static CONFIG: std::sync::LazyLock<Arc<ClientConfig>> = std::sync::LazyLock::new
 });
 
 pub fn create_secured_stream(conn: &Connection) -> Result<HttpStream, Error> {
+    // Rustls setup
     log::trace!("Setting up TLS parameters for {}.", conn.request.url.host);
     
-    let dns_name = match ServerName::try_from(conn.request.url.host.as_str()) {
+    let dns_name = match ServerName::try_from(conn.request.url.host.clone()) {
         Ok(result) => result,
         Err(err) => return Err(Error::IoError(io::Error::new(io::ErrorKind::Other, err))),
     };
 
     let sess =
         ClientConnection::new(CONFIG.clone(), dns_name).map_err(Error::RustlsCreateConnection)?;
-    
+
+    // Connect
     log::trace!("Establishing TCP connection to {}.", conn.request.url.host);
     let tcp = conn.connect()?;
-    
+
+    // Send request
     log::trace!("Establishing TLS session to {}.", conn.request.url.host);
-    let mut tls = StreamOwned::new(sess, tcp);
+    let mut tls = StreamOwned::new(sess, tcp); // I don't think this actually does any communication.
     log::trace!("Writing HTTPS request to {}.", conn.request.url.host);
     let _ = tls.get_ref().set_write_timeout(conn.timeout()?);
     tls.write_all(&conn.request.as_bytes())?;
