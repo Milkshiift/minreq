@@ -1,7 +1,8 @@
 //! TLS connection handling functionality when using the `rustls` crate for
 //! handling TLS.
 
-use rustls::{self, ClientConfig, ClientConnection, RootCertStore, ServerName, StreamOwned};
+use rustls::{self, ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+use rustls::pki_types::ServerName;
 use std::convert::TryFrom;
 use std::io::{self, Write};
 use std::net::TcpStream;
@@ -24,44 +25,44 @@ static CONFIG: std::sync::LazyLock<Arc<ClientConfig>> = std::sync::LazyLock::new
         for root_cert in os_roots {
             // Ignore erroneous OS certificates, there's nothing
             // to do differently in that situation anyways.
-            let _ = root_certificates.add(&rustls::Certificate(root_cert.0));
+            let _ = root_certificates.add(root_cert);
         }
     }
 
     #[cfg(feature = "rustls-webpki")]
-    #[allow(deprecated)] // Need to use add_server_trust_anchors to compile with rustls 0.21.1
-    root_certificates.add_server_trust_anchors(TLS_SERVER_ROOTS.iter().map(|ta| {
-        rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-            ta.subject,
-            ta.spki,
-            ta.name_constraints,
-        )
-    }));
-
+    {
+        for ta in TLS_SERVER_ROOTS {
+            let trust_anchor = rustls::pki_types::TrustAnchor {
+                subject: ta.subject,
+                subject_public_key_info: ta.subject_public_key_info,
+                name_constraints: ta.name_constraints,
+            };
+            root_certificates.add_trust_anchors([trust_anchor]);
+        }
+    }
+    
     let config = ClientConfig::builder()
-        .with_safe_defaults()
         .with_root_certificates(root_certificates)
         .with_no_client_auth();
     Arc::new(config)
 });
 
 pub fn create_secured_stream(conn: &Connection) -> Result<HttpStream, Error> {
-    // Rustls setup
     log::trace!("Setting up TLS parameters for {}.", conn.request.url.host);
-    let dns_name = match ServerName::try_from(&*conn.request.url.host) {
+    
+    let dns_name = match ServerName::try_from(conn.request.url.host.as_str()) {
         Ok(result) => result,
         Err(err) => return Err(Error::IoError(io::Error::new(io::ErrorKind::Other, err))),
     };
+
     let sess =
         ClientConnection::new(CONFIG.clone(), dns_name).map_err(Error::RustlsCreateConnection)?;
-
-    // Connect
+    
     log::trace!("Establishing TCP connection to {}.", conn.request.url.host);
     let tcp = conn.connect()?;
-
-    // Send request
+    
     log::trace!("Establishing TLS session to {}.", conn.request.url.host);
-    let mut tls = StreamOwned::new(sess, tcp); // I don't think this actually does any communication.
+    let mut tls = StreamOwned::new(sess, tcp);
     log::trace!("Writing HTTPS request to {}.", conn.request.url.host);
     let _ = tls.get_ref().set_write_timeout(conn.timeout()?);
     tls.write_all(&conn.request.as_bytes())?;
