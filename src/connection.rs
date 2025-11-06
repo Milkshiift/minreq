@@ -7,14 +7,15 @@ use std::time::{Duration, Instant};
 
 type UnsecuredStream = TcpStream;
 
-#[cfg(any(feature = "rustls", feature = "native-tls", feature = "openssl"))]
-mod tls;
-
 #[cfg(feature = "rustls")]
 mod rustls_stream;
+#[cfg(feature = "rustls")]
+type SecuredStream = rustls_stream::SecuredStream;
 
 #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
 mod native_tls_stream;
+#[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
+type SecuredStream = native_tls_stream::SecuredStream;
 
 #[cfg(all(
     not(feature = "rustls"),
@@ -22,27 +23,27 @@ mod native_tls_stream;
     feature = "openssl",
 ))]
 mod openssl_stream;
-
-#[cfg(any(feature = "rustls", feature = "native-tls", feature = "openssl"))]
-type SecuredStream = dyn tls::TlsStream;
+#[cfg(all(
+    not(feature = "rustls"),
+    not(feature = "native-tls"),
+    feature = "openssl",
+))]
+type SecuredStream = openssl_stream::SecuredStream;
 
 pub(crate) enum HttpStream {
-    Unsecured(UnsecuredStream),
+    Unsecured(UnsecuredStream, Option<Instant>),
     #[cfg(any(feature = "rustls", feature = "native-tls", feature = "openssl",))]
-    Secured(Box<SecuredStream>),
+    Secured(Box<SecuredStream>, Option<Instant>),
 }
 
 impl HttpStream {
-    fn create_unsecured(reader: UnsecuredStream, timeout_at: Option<Instant>) -> Result<HttpStream, io::Error> {
-        if let Some(duration) = timeout_at_to_duration(timeout_at)? {
-            reader.set_read_timeout(Some(duration))?;
-        }
-        Ok(HttpStream::Unsecured(reader))
+    fn create_unsecured(reader: UnsecuredStream, timeout_at: Option<Instant>) -> HttpStream {
+        HttpStream::Unsecured(reader, timeout_at)
     }
 
     #[cfg(any(feature = "rustls", feature = "native-tls", feature = "openssl"))]
-    fn create_secured(reader: Box<SecuredStream>, timeout_at: Option<Instant>) -> HttpStream {
-        HttpStream::Secured(reader)
+    fn create_secured(reader: SecuredStream, timeout_at: Option<Instant>) -> HttpStream {
+        HttpStream::Secured(Box::new(reader), timeout_at)
     }
 }
 
@@ -67,10 +68,21 @@ fn timeout_at_to_duration(timeout_at: Option<Instant>) -> Result<Option<Duration
 
 impl Read for HttpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let timeout = |tcp: &TcpStream, timeout_at: Option<Instant>| -> io::Result<()> {
+            let _ = tcp.set_read_timeout(timeout_at_to_duration(timeout_at)?);
+            Ok(())
+        };
+
         let result = match self {
-            HttpStream::Unsecured(inner) => inner.read(buf),
+            HttpStream::Unsecured(inner, timeout_at) => {
+                timeout(inner, *timeout_at)?;
+                inner.read(buf)
+            }
             #[cfg(any(feature = "rustls", feature = "openssl", feature = "native-tls"))]
-            HttpStream::Secured(inner) => inner.read(buf),
+            HttpStream::Secured(inner, timeout_at) => {
+                timeout(inner.get_ref(), *timeout_at)?;
+                inner.read(buf)
+            }
         };
         match result {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -126,40 +138,21 @@ impl Connection {
         enforce_timeout(self.timeout_at, move || {
             self.request.url.host = ensure_ascii_host(self.request.url.host)?;
 
-            #[cfg(feature = "log")]
-            log::trace!("Establishing TCP connection to {}.", self.request.url.host);
-            let tcp = self.connect()?;
-
-            let mut secured_stream: Box<dyn tls::TlsStream> = {
-                #[cfg(feature = "rustls")]
-                {
-                    Box::new(rustls_stream::create_stream(&self, tcp)?)
-                }
-                #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
-                {
-                    Box::new(native_tls_stream::create_stream(&self, tcp)?)
-                }
-                #[cfg(all(
-                    not(feature = "rustls"),
-                    not(feature = "native-tls"),
-                    feature = "openssl",
-                ))]
-                {
-                    Box::new(openssl_stream::create_stream(&self, tcp)?)
-                }
-            };
-
-            #[cfg(feature = "log")]
-            log::trace!("Writing HTTPS request to {}.", self.request.url.host);
-            let _ = secured_stream.get_ref().set_write_timeout(self.timeout()?);
-            secured_stream.write_all(&self.request.as_bytes())?;
-
-            let stream = HttpStream::create_secured(secured_stream, self.timeout_at);
+            #[cfg(feature = "rustls")]
+            let secured_stream = rustls_stream::create_secured_stream(&self)?;
+            #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
+            let secured_stream = native_tls_stream::create_secured_stream(&self)?;
+            #[cfg(all(
+                not(feature = "rustls"),
+                not(feature = "native-tls"),
+                feature = "openssl",
+            ))]
+            let secured_stream = openssl_stream::create_secured_stream(&self)?;
 
             #[cfg(feature = "log")]
             log::trace!("Reading HTTPS response from {}.", self.request.url.host);
             let response = ResponseLazy::from_stream(
-                stream,
+                secured_stream,
                 self.request.config.max_headers_size,
                 self.request.config.max_status_line_len,
             )?;
@@ -188,7 +181,7 @@ impl Connection {
             // Receive response
             #[cfg(feature = "log")]
             log::trace!("Reading HTTP response.");
-            let stream = HttpStream::create_unsecured(tcp, self.timeout_at)?;
+            let stream = HttpStream::create_unsecured(tcp, self.timeout_at);
             let response = ResponseLazy::from_stream(
                 stream,
                 self.request.config.max_headers_size,
@@ -230,10 +223,18 @@ impl Connection {
                 write!(tcp, "{}", proxy.connect(&self.request)).unwrap();
                 tcp.flush()?;
 
-                let mut reader = BufReader::new(&mut tcp);
-                let mut status_line = String::new();
-                reader.read_line(&mut status_line)?;
-                crate::Proxy::verify_response(status_line.as_bytes())?;
+                let mut proxy_response = Vec::new();
+
+                loop {
+                    let mut buf = vec![0; 256];
+                    let total = tcp.read(&mut buf)?;
+                    proxy_response.append(&mut buf);
+                    if total < 256 {
+                        break;
+                    }
+                }
+
+                crate::Proxy::verify_response(&proxy_response)?;
 
                 Ok(tcp)
             }
@@ -326,14 +327,16 @@ fn ensure_ascii_host(host: String) -> Result<String, Error> {
             let mut result = String::with_capacity(host.len() * 2);
             for s in host.split('.') {
                 if s.is_ascii() {
-                    result.push_str(s);
+                    result += s;
                 } else {
-                    result.push_str("xn--");
-                    result.push_str(&punycode::encode(s)?);
+                    match punycode::encode(s) {
+                        Ok(s) => result = result + "xn--" + &s,
+                        Err(_) => return Err(Error::PunycodeConversionFailed),
+                    }
                 }
-                result.push('.');
+                result += ".";
             }
-            result.pop(); // Remove trailing dot
+            result.truncate(result.len() - 1); // Remove the trailing dot
             Ok(result)
         }
     }

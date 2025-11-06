@@ -1,23 +1,19 @@
 //! TLS connection handling functionality when using the `rustls` crate for
 //! handling TLS.
 
-use crate::Error;
-use rustls::pki_types::ServerName;
 use rustls::{self, ClientConfig, ClientConnection, RootCertStore, StreamOwned};
-use std::io::{self};
+use rustls::pki_types::ServerName;
+use std::io::{self, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 #[cfg(feature = "rustls-webpki")]
 use webpki_roots::TLS_SERVER_ROOTS;
 
-use super::tls::TlsStream as TlsStreamTrait;
-use super::Connection;
+use crate::Error;
 
-impl TlsStreamTrait for StreamOwned<ClientConnection, TcpStream> {
-    fn get_ref(&self) -> &TcpStream {
-        self.get_ref()
-    }
-}
+use super::{Connection, HttpStream};
+
+pub type SecuredStream = StreamOwned<ClientConnection, TcpStream>;
 
 static CONFIG: std::sync::LazyLock<Arc<ClientConfig>> = std::sync::LazyLock::new(|| {
     let mut root_certificates = RootCertStore::empty();
@@ -41,19 +37,30 @@ static CONFIG: std::sync::LazyLock<Arc<ClientConfig>> = std::sync::LazyLock::new
     Arc::new(config)
 });
 
-pub(super) fn create_stream(
-    conn: &Connection,
-    tcp: TcpStream,
-) -> Result<impl TlsStreamTrait, Error> {
+pub fn create_secured_stream(conn: &Connection) -> Result<HttpStream, Error> {
     // Rustls setup
     #[cfg(feature = "log")]
     log::trace!("Setting up TLS parameters for {}.", conn.request.url.host);
-    let dns_name = ServerName::try_from(conn.request.url.host.as_str())
-        .map_err(|err| Error::IoError(io::Error::new(io::ErrorKind::Other, err)))?;
-    let sess = ClientConnection::new(CONFIG.clone(), dns_name).map_err(Error::TlsError)?;
+    let dns_name = match ServerName::try_from(conn.request.url.host.as_str()) {
+        Ok(result) => result,
+        Err(err) => return Err(Error::IoError(io::Error::new(io::ErrorKind::Other, err))),
+    };
+    let sess =
+        ClientConnection::new(CONFIG.clone(), dns_name).map_err(Error::RustlsCreateConnection)?;
 
-    // Establish TLS session
+    // Connect
+    #[cfg(feature = "log")]
+    log::trace!("Establishing TCP connection to {}.", conn.request.url.host);
+    let tcp = conn.connect()?;
+
+    // Send request
     #[cfg(feature = "log")]
     log::trace!("Establishing TLS session to {}.", conn.request.url.host);
-    Ok(StreamOwned::new(sess, tcp))
+    let mut tls = StreamOwned::new(sess, tcp); // I don't think this actually does any communication.
+    #[cfg(feature = "log")]
+    log::trace!("Writing HTTPS request to {}.", conn.request.url.host);
+    let _ = tls.get_ref().set_write_timeout(conn.timeout()?);
+    tls.write_all(&conn.request.as_bytes())?;
+
+    Ok(HttpStream::create_secured(tls, conn.timeout_at))
 }
