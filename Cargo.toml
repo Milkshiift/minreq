@@ -18,21 +18,21 @@ maintenance = { status = "passively-maintained" }
 
 [dependencies]
 # For the urlencoding feature:
-urlencoding = { version = "2.1.0", optional = true }
+urlencoding = { version = "2.1", optional = true }
 # For the punycode feature:
-punycode = { version = "0.4.1", optional = true }
+punycode = { version = "0.4", optional = true }
 # For the json-using-serde feature:
-serde = { version = "1.0.101", optional = true }
-serde_json = { version = "1.0.0", optional = true }
+serde = { version = "1.0", optional = true }
+serde_json = { version = "1.0", optional = true }
 # For the proxy feature:
 base64 = { version = "0.22", optional = true }
 # For the https features:
-rustls = { version = "0.21.1", optional = true }
-rustls-native-certs = { version = "0.6.1", optional = true }
-webpki-roots = { version = "0.25.2", optional = true }
-rustls-webpki = { version = "0.101.0", optional = true }
-openssl = { version = "0.10.29", optional = true }
-log = { version = "0.4.0", optional = true }
+rustls = { version = "0.23", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+webpki-roots = { version = "1.0", optional = true }
+rustls-webpki = { version = "0.103", optional = true }
+openssl = { version = "0.10", optional = true }
+log = { version = "0.4", optional = true }
 openssl-probe = { version = "0.1", optional = true }
 native-tls = { version = "0.2", optional = true }
 
@@ -55,6 +55,10 @@ proxy = ["base64"]
 
 [[example]]
 name = "hello"
+
+[[example]]
+name = "hello_https"
+required-features = ["https-rustls"]
 
 [[example]]
 name = "iterator"

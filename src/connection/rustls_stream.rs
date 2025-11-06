@@ -1,8 +1,8 @@
 //! TLS connection handling functionality when using the `rustls` crate for
 //! handling TLS.
 
-use rustls::{self, ClientConfig, ClientConnection, RootCertStore, ServerName, StreamOwned};
-use std::convert::TryFrom;
+use rustls::{self, ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+use rustls::pki_types::ServerName;
 use std::io::{self, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -24,22 +24,14 @@ static CONFIG: std::sync::LazyLock<Arc<ClientConfig>> = std::sync::LazyLock::new
         for root_cert in os_roots {
             // Ignore erroneous OS certificates, there's nothing
             // to do differently in that situation anyways.
-            let _ = root_certificates.add(&rustls::Certificate(root_cert.0));
+            let _ = root_certificates.add(root_cert);
         }
     }
 
     #[cfg(feature = "rustls-webpki")]
-    #[allow(deprecated)] // Need to use add_server_trust_anchors to compile with rustls 0.21.1
-    root_certificates.add_server_trust_anchors(TLS_SERVER_ROOTS.iter().map(|ta| {
-        rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-            ta.subject,
-            ta.spki,
-            ta.name_constraints,
-        )
-    }));
+    root_certificates.extend(TLS_SERVER_ROOTS.iter().cloned());
 
     let config = ClientConfig::builder()
-        .with_safe_defaults()
         .with_root_certificates(root_certificates)
         .with_no_client_auth();
     Arc::new(config)
@@ -49,7 +41,7 @@ pub fn create_secured_stream(conn: &Connection) -> Result<HttpStream, Error> {
     // Rustls setup
     #[cfg(feature = "log")]
     log::trace!("Setting up TLS parameters for {}.", conn.request.url.host);
-    let dns_name = match ServerName::try_from(&*conn.request.url.host) {
+    let dns_name = match ServerName::try_from(conn.request.url.host.as_str()) {
         Ok(result) => result,
         Err(err) => return Err(Error::IoError(io::Error::new(io::ErrorKind::Other, err))),
     };
