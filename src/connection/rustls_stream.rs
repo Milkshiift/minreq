@@ -3,6 +3,7 @@
 
 use rustls::{self, ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use rustls::pki_types::ServerName;
+use std::convert::TryFrom;
 use std::io::{self, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -42,7 +43,7 @@ pub fn create_secured_stream(conn: &Connection) -> Result<HttpStream, Error> {
     #[cfg(feature = "log")]
     log::trace!("Setting up TLS parameters for {}.", conn.request.url.host);
     let dns_name = match ServerName::try_from(conn.request.url.host.as_str()) {
-        Ok(result) => result,
+        Ok(result) => result.to_owned(),
         Err(err) => return Err(Error::IoError(io::Error::new(io::ErrorKind::Other, err))),
     };
     let sess =
