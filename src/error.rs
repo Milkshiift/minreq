@@ -16,7 +16,7 @@ pub enum Error {
 
     #[cfg(feature = "rustls")]
     /// Ran into a rustls error while creating the connection.
-    RustlsCreateConnection(rustls::Error),
+    TlsError(rustls::Error),
     // TODO: Add separate errors for openssl and native_tls errors as well
     /// Ran into an IO problem while loading the response.
     IoError(io::Error),
@@ -95,7 +95,7 @@ impl fmt::Display for Error {
             InvalidUtf8InBody(err) => write!(f, "{}", err),
 
             #[cfg(feature = "rustls")]
-            RustlsCreateConnection(err) => write!(f, "error creating rustls connection: {}", err),
+            TlsError(err) => write!(f, "error creating rustls connection: {}", err),
             MalformedChunkLength => write!(f, "non-usize chunk length with transfer-encoding: chunked"),
             MalformedChunkEnd => write!(f, "chunk did not end after reading the expected amount of bytes"),
             MalformedContentLength => write!(f, "non-usize content length"),
@@ -130,7 +130,7 @@ impl error::Error for Error {
             IoError(err) => Some(err),
             InvalidUtf8InBody(err) => Some(err),
             #[cfg(feature = "rustls")]
-            RustlsCreateConnection(err) => Some(err),
+            TlsError(err) => Some(err),
             _ => None,
         }
     }

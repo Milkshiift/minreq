@@ -7,15 +7,14 @@ use std::time::{Duration, Instant};
 
 type UnsecuredStream = TcpStream;
 
+#[cfg(any(feature = "rustls", feature = "native-tls", feature = "openssl"))]
+mod tls;
+
 #[cfg(feature = "rustls")]
 mod rustls_stream;
-#[cfg(feature = "rustls")]
-type SecuredStream = rustls_stream::SecuredStream;
 
 #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
 mod native_tls_stream;
-#[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
-type SecuredStream = native_tls_stream::SecuredStream;
 
 #[cfg(all(
     not(feature = "rustls"),
@@ -23,12 +22,9 @@ type SecuredStream = native_tls_stream::SecuredStream;
     feature = "openssl",
 ))]
 mod openssl_stream;
-#[cfg(all(
-    not(feature = "rustls"),
-    not(feature = "native-tls"),
-    feature = "openssl",
-))]
-type SecuredStream = openssl_stream::SecuredStream;
+
+#[cfg(any(feature = "rustls", feature = "native-tls", feature = "openssl"))]
+type SecuredStream = dyn tls::TlsStream;
 
 pub(crate) enum HttpStream {
     Unsecured(UnsecuredStream, Option<Instant>),
@@ -42,8 +38,8 @@ impl HttpStream {
     }
 
     #[cfg(any(feature = "rustls", feature = "native-tls", feature = "openssl"))]
-    fn create_secured(reader: SecuredStream, timeout_at: Option<Instant>) -> HttpStream {
-        HttpStream::Secured(Box::new(reader), timeout_at)
+    fn create_secured(reader: Box<SecuredStream>, timeout_at: Option<Instant>) -> HttpStream {
+        HttpStream::Secured(reader, timeout_at)
     }
 }
 
@@ -138,21 +134,40 @@ impl Connection {
         enforce_timeout(self.timeout_at, move || {
             self.request.url.host = ensure_ascii_host(self.request.url.host)?;
 
-            #[cfg(feature = "rustls")]
-            let secured_stream = rustls_stream::create_secured_stream(&self)?;
-            #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
-            let secured_stream = native_tls_stream::create_secured_stream(&self)?;
-            #[cfg(all(
-                not(feature = "rustls"),
-                not(feature = "native-tls"),
-                feature = "openssl",
-            ))]
-            let secured_stream = openssl_stream::create_secured_stream(&self)?;
+            #[cfg(feature = "log")]
+            log::trace!("Establishing TCP connection to {}.", self.request.url.host);
+            let tcp = self.connect()?;
+
+            let mut secured_stream: Box<dyn tls::TlsStream> = {
+                #[cfg(feature = "rustls")]
+                {
+                    Box::new(rustls_stream::create_stream(&self, tcp)?)
+                }
+                #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
+                {
+                    Box::new(native_tls_stream::create_stream(&self, tcp)?)
+                }
+                #[cfg(all(
+                    not(feature = "rustls"),
+                    not(feature = "native-tls"),
+                    feature = "openssl",
+                ))]
+                {
+                    Box::new(openssl_stream::create_stream(&self, tcp)?)
+                }
+            };
+
+            #[cfg(feature = "log")]
+            log::trace!("Writing HTTPS request to {}.", self.request.url.host);
+            let _ = secured_stream.get_ref().set_write_timeout(self.timeout()?);
+            secured_stream.write_all(&self.request.as_bytes())?;
+
+            let stream = HttpStream::create_secured(secured_stream, self.timeout_at);
 
             #[cfg(feature = "log")]
             log::trace!("Reading HTTPS response from {}.", self.request.url.host);
             let response = ResponseLazy::from_stream(
-                secured_stream,
+                stream,
                 self.request.config.max_headers_size,
                 self.request.config.max_status_line_len,
             )?;

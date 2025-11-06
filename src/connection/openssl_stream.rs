@@ -29,14 +29,19 @@ use openssl::error::ErrorStack;
 use openssl::ssl::{SslConnector, SslMethod, SslStream, SslVersion};
 use openssl::x509::X509;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self};
 use std::net::TcpStream;
 
 use crate::Error;
 
-use super::{Connection, HttpStream};
+use super::tls::TlsStream as TlsStreamTrait;
+use super::Connection;
 
-pub type SecuredStream = SslStream<TcpStream>;
+impl TlsStreamTrait for SslStream<TcpStream> {
+    fn get_ref(&self) -> &TcpStream {
+        self.get_ref()
+    }
+}
 
 impl From<ErrorStack> for Error {
     fn from(err: ErrorStack) -> Self {
@@ -44,7 +49,10 @@ impl From<ErrorStack> for Error {
     }
 }
 
-pub fn create_secured_stream(conn: &Connection) -> Result<HttpStream, Error> {
+pub(super) fn create_stream(
+    conn: &Connection,
+    tcp: TcpStream,
+) -> Result<impl TlsStreamTrait, Error> {
     // openssl setup
     #[cfg(feature = "log")]
     log::trace!("Setting up TLS parameters for {}.", conn.request.url.host);
@@ -77,27 +85,12 @@ pub fn create_secured_stream(conn: &Connection) -> Result<HttpStream, Error> {
         connector_builder.build().configure()?
     };
 
-    // Connect
-    #[cfg(feature = "log")]
-    log::trace!("Establishing TCP connection to {}.", conn.request.url.host);
-    let tcp = conn.connect()?;
-
-    // Send request
+    // Establish TLS session
     #[cfg(feature = "log")]
     log::trace!("Establishing TLS session to {}.", conn.request.url.host);
-    let mut tls = match connector
+    connector
         .use_server_name_indication(true)
         .verify_hostname(true)
         .connect(&conn.request.url.host, tcp)
-    {
-        Ok(tls) => tls,
-        Err(err) => return Err(Error::IoError(io::Error::new(io::ErrorKind::Other, err))),
-    };
-
-    #[cfg(feature = "log")]
-    log::trace!("Writing HTTPS request to {}.", conn.request.url.host);
-    let _ = tls.get_ref().set_write_timeout(conn.timeout()?);
-    tls.write_all(&conn.request.as_bytes())?;
-
-    Ok(HttpStream::create_secured(tls, conn.timeout_at))
+        .map_err(|err| Error::IoError(io::Error::new(io::ErrorKind::Other, err)))
 }
