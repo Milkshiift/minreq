@@ -40,11 +40,12 @@ impl Response {
     pub(crate) fn create(mut parent: ResponseLazy, is_head: bool) -> Result<Response, Error> {
         let mut body = Vec::new();
         if !is_head && parent.status_code != 204 && parent.status_code != 304 {
-            for byte in &mut parent {
-                let (byte, length) = byte?;
-                body.reserve(length);
-                body.push(byte);
+            if let Some(len_str) = parent.headers.get("content-length") {
+                if let Ok(len) = len_str.parse::<usize>() {
+                    body.reserve(len);
+                }
             }
+            parent.read_to_end(&mut body)?;
         }
 
         let ResponseLazy {
@@ -338,7 +339,7 @@ fn read_trailers(
         if let Some(ref mut max_headers_size) = max_headers_size {
             *max_headers_size -= trailer_line.len() + 2;
         }
-        if let Some((header, value)) = parse_header(trailer_line) {
+        if let Some((header, value)) = parse_header(&trailer_line) {
             headers.insert(header, value);
         } else {
             break;
@@ -474,7 +475,7 @@ fn read_metadata(
         if let Some(ref mut max_headers_size) = max_headers_size {
             *max_headers_size -= line.len() + 2;
         }
-        if let Some(header) = parse_header(line) {
+        if let Some(header) = parse_header(&line) {
             headers.insert(header.0, header.1);
         }
     }
@@ -520,78 +521,51 @@ fn read_line(
     max_len: Option<usize>,
     overflow_error: Error,
 ) -> Result<String, Error> {
-    let mut bytes = Vec::with_capacity(32);
+    let mut bytes = Vec::with_capacity(64);
+
     for byte in stream {
-        match byte {
-            Ok(byte) => {
-                if let Some(max_len) = max_len {
-                    if bytes.len() >= max_len {
-                        return Err(overflow_error);
-                    }
-                }
-                if byte == b'\n' {
-                    if let Some(b'\r') = bytes.last() {
-                        bytes.pop();
-                    }
-                    break;
-                } else {
-                    bytes.push(byte);
-                }
+        let byte = byte.map_err(Error::IoError)?;
+
+        if byte == b'\n' {
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
             }
-            Err(err) => return Err(Error::IoError(err)),
+            break;
         }
+
+        if let Some(max_len) = max_len {
+            if bytes.len() >= max_len {
+                return Err(overflow_error);
+            }
+        }
+
+        bytes.push(byte);
     }
-    String::from_utf8(bytes).map_err(|_error| Error::InvalidUtf8InResponse)
+
+    String::from_utf8(bytes).map_err(|_| Error::InvalidUtf8InResponse)
 }
 
 fn parse_status_line(line: &str) -> (i32, String) {
-    // sample status line format
     // HTTP/1.1 200 OK
-    let mut status_code = String::with_capacity(3);
-    let mut reason_phrase = String::with_capacity(2);
+    let mut parts = line.splitn(3, ' ');
 
-    let mut spaces = 0;
+    parts.next(); // Skip HTTP version
 
-    for c in line.chars() {
-        if spaces >= 2 {
-            reason_phrase.push(c);
-        }
+    let status = parts.next()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(503);
 
-        if c == ' ' {
-            spaces += 1;
-        } else if spaces == 1 {
-            status_code.push(c);
-        }
-    }
+    let reason = parts.next()
+        .unwrap_or("Server did not provide a status line")
+        .to_string();
 
-    if let Ok(status_code) = status_code.parse::<i32>() {
-        return (status_code, reason_phrase);
-    }
-
-    (503, "Server did not provide a status line".to_string())
+    (status, reason)
 }
 
-fn parse_header(mut line: String) -> Option<(String, String)> {
-    if let Some(location) = line.find(':') {
-        // Trim the first character of the header if it is a space,
-        // otherwise return everything after the ':'. This should
-        // preserve the behavior in versions <=2.0.1 in most cases
-        // (namely, ones where it was valid), where the first
-        // character after ':' was always cut off.
-        let value = if let Some(sp) = line.get(location + 1..location + 2) {
-            if sp == " " {
-                line[location + 2..].to_string()
-            } else {
-                line[location + 1..].to_string()
-            }
-        } else {
-            line[location + 1..].to_string()
-        };
-
-        line.truncate(location);
-        // Headers should be ascii, I'm pretty sure. If not, please open an issue.
-        line.make_ascii_lowercase();
-        return Some((line, value));
-    }
-    None
+fn parse_header(line: &str) -> Option<(String, String)> {
+    let (key, value) = line.split_once(':')?;
+    Some((
+        key.trim().to_ascii_lowercase(),
+        value.trim().to_string()
+    ))
 }

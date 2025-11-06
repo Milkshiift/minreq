@@ -38,7 +38,6 @@ native-tls = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tiny_http = "0.12"
-chrono = "0.4.0"
 
 [package.metadata.docs.rs]
 features = ["json-using-serde", "proxy", "https", "punycode"]
@@ -62,6 +61,9 @@ required-features = ["https-rustls"]
 
 [[example]]
 name = "iterator"
+
+[[example]]
+name = "basic_bench"
 
 [[example]]
 name = "json"

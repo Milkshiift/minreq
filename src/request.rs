@@ -1,3 +1,4 @@
+use std::io::Write;
 use crate::connection::Connection;
 use crate::http_url::{HttpUrl, Port};
 #[cfg(feature = "proxy")]
@@ -5,7 +6,6 @@ use crate::proxy::Proxy;
 use crate::{Error, Response, ResponseLazy};
 use std::collections::HashMap;
 use std::fmt;
-use std::fmt::Write;
 
 /// A URL type for requests.
 pub type URL = String;
@@ -384,64 +384,50 @@ impl ParsedRequest {
         })
     }
 
-    fn get_http_head(&self) -> String {
-        let mut http = String::with_capacity(32);
+    fn get_http_head(&self) -> Vec<u8> {
+        let estimated_size = 128 + self.config.headers.len() * 40;
+        let mut http = Vec::with_capacity(estimated_size);
 
-        // NOTE: As of 2.10.0, the fragment is intentionally left out of the request, based on:
-        // - [RFC 3986 section 3.5](https://datatracker.ietf.org/doc/html/rfc3986#section-3.5):
-        //   "...the fragment identifier is not used in the scheme-specific
-        //   processing of a URI; instead, the fragment identifier is separated
-        //   from the rest of the URI prior to a dereference..."
-        // - [RFC 7231 section 9.5](https://datatracker.ietf.org/doc/html/rfc7231#section-9.5):
-        //   "Although fragment identifiers used within URI references are not
-        //   sent in requests..."
-
-        // Add the request line and the "Host" header
         write!(
-            http,
+            &mut http,
             "{} {} HTTP/1.1\r\nHost: {}",
             self.config.method, self.url.path_and_query, self.url.host
-        )
-        .unwrap();
-        if let Port::Explicit(port) = self.url.port {
-            write!(http, ":{}", port).unwrap();
-        }
-        http += "\r\n";
+        ).unwrap();
 
-        // Add other headers
+        if let Port::Explicit(port) = self.url.port {
+            write!(&mut http, ":{}", port).unwrap();
+        }
+        http.extend_from_slice(b"\r\n");
+
         for (k, v) in &self.config.headers {
-            write!(http, "{}: {}\r\n", k, v).unwrap();
+            http.extend_from_slice(k.as_bytes());
+            http.extend_from_slice(b": ");
+            http.extend_from_slice(v.as_bytes());
+            http.extend_from_slice(b"\r\n");
         }
 
         if self.config.method == Method::Post
             || self.config.method == Method::Put
             || self.config.method == Method::Patch
         {
-            let not_length = |key: &String| {
-                let key = key.to_lowercase();
-                key != "content-length" && key != "transfer-encoding"
-            };
-            if self.config.headers.keys().all(not_length) {
-                // A user agent SHOULD send a Content-Length in a request message when no Transfer-Encoding
-                // is sent and the request method defines a meaning for an enclosed payload body.
-                // refer: https://tools.ietf.org/html/rfc7230#section-3.3.2
+            let has_length_header = self.config.headers.keys().any(|key| {
+                key.eq_ignore_ascii_case("content-length")
+                    || key.eq_ignore_ascii_case("transfer-encoding")
+            });
 
-                // A client MUST NOT send a message body in a TRACE request.
-                // refer: https://tools.ietf.org/html/rfc7231#section-4.3.8
-                // similar line found for GET, HEAD, CONNECT and DELETE.
-
-                http += "Content-Length: 0\r\n";
+            if !has_length_header {
+                http.extend_from_slice(b"Content-Length: 0\r\n");
             }
         }
 
-        http += "\r\n";
+        http.extend_from_slice(b"\r\n");
         http
     }
 
     /// Returns the HTTP request as bytes, ready to be sent to
     /// the server.
     pub(crate) fn as_bytes(&self) -> Vec<u8> {
-        let mut head = self.get_http_head().into_bytes();
+        let mut head = self.get_http_head();
         if let Some(body) = &self.config.body {
             head.extend(body);
         }

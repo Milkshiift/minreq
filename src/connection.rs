@@ -27,19 +27,22 @@ mod openssl_stream;
 type SecuredStream = dyn tls::TlsStream;
 
 pub(crate) enum HttpStream {
-    Unsecured(UnsecuredStream, Option<Instant>),
+    Unsecured(UnsecuredStream),
     #[cfg(any(feature = "rustls", feature = "native-tls", feature = "openssl",))]
-    Secured(Box<SecuredStream>, Option<Instant>),
+    Secured(Box<SecuredStream>),
 }
 
 impl HttpStream {
-    fn create_unsecured(reader: UnsecuredStream, timeout_at: Option<Instant>) -> HttpStream {
-        HttpStream::Unsecured(reader, timeout_at)
+    fn create_unsecured(reader: UnsecuredStream, timeout_at: Option<Instant>) -> Result<HttpStream, io::Error> {
+        if let Some(duration) = timeout_at_to_duration(timeout_at)? {
+            reader.set_read_timeout(Some(duration))?;
+        }
+        Ok(HttpStream::Unsecured(reader))
     }
 
     #[cfg(any(feature = "rustls", feature = "native-tls", feature = "openssl"))]
     fn create_secured(reader: Box<SecuredStream>, timeout_at: Option<Instant>) -> HttpStream {
-        HttpStream::Secured(reader, timeout_at)
+        HttpStream::Secured(reader)
     }
 }
 
@@ -64,21 +67,10 @@ fn timeout_at_to_duration(timeout_at: Option<Instant>) -> Result<Option<Duration
 
 impl Read for HttpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let timeout = |tcp: &TcpStream, timeout_at: Option<Instant>| -> io::Result<()> {
-            let _ = tcp.set_read_timeout(timeout_at_to_duration(timeout_at)?);
-            Ok(())
-        };
-
         let result = match self {
-            HttpStream::Unsecured(inner, timeout_at) => {
-                timeout(inner, *timeout_at)?;
-                inner.read(buf)
-            }
+            HttpStream::Unsecured(inner) => inner.read(buf),
             #[cfg(any(feature = "rustls", feature = "openssl", feature = "native-tls"))]
-            HttpStream::Secured(inner, timeout_at) => {
-                timeout(inner.get_ref(), *timeout_at)?;
-                inner.read(buf)
-            }
+            HttpStream::Secured(inner) => inner.read(buf),
         };
         match result {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -196,7 +188,7 @@ impl Connection {
             // Receive response
             #[cfg(feature = "log")]
             log::trace!("Reading HTTP response.");
-            let stream = HttpStream::create_unsecured(tcp, self.timeout_at);
+            let stream = HttpStream::create_unsecured(tcp, self.timeout_at)?;
             let response = ResponseLazy::from_stream(
                 stream,
                 self.request.config.max_headers_size,
@@ -238,18 +230,10 @@ impl Connection {
                 write!(tcp, "{}", proxy.connect(&self.request)).unwrap();
                 tcp.flush()?;
 
-                let mut proxy_response = Vec::new();
-
-                loop {
-                    let mut buf = vec![0; 256];
-                    let total = tcp.read(&mut buf)?;
-                    proxy_response.append(&mut buf);
-                    if total < 256 {
-                        break;
-                    }
-                }
-
-                crate::Proxy::verify_response(&proxy_response)?;
+                let mut reader = BufReader::new(&mut tcp);
+                let mut status_line = String::new();
+                reader.read_line(&mut status_line)?;
+                crate::Proxy::verify_response(status_line.as_bytes())?;
 
                 Ok(tcp)
             }
@@ -342,16 +326,14 @@ fn ensure_ascii_host(host: String) -> Result<String, Error> {
             let mut result = String::with_capacity(host.len() * 2);
             for s in host.split('.') {
                 if s.is_ascii() {
-                    result += s;
+                    result.push_str(s);
                 } else {
-                    match punycode::encode(s) {
-                        Ok(s) => result = result + "xn--" + &s,
-                        Err(_) => return Err(Error::PunycodeConversionFailed),
-                    }
+                    result.push_str("xn--");
+                    result.push_str(&punycode::encode(s)?);
                 }
-                result += ".";
+                result.push('.');
             }
-            result.truncate(result.len() - 1); // Remove the trailing dot
+            result.pop(); // Remove trailing dot
             Ok(result)
         }
     }

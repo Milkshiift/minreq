@@ -113,24 +113,10 @@ impl HttpUrl {
                     | '?' => {
                         resource.push(c);
                     }
-                    // There is probably a simpler way to do this, but this
-                    // method avoids any heap allocations (except extending
-                    // `resource`)
                     _ => {
-                        // Any UTF-8 character can fit in 4 bytes
-                        let mut utf8_buf = [0u8; 4];
-                        // Bytes fill buffer from the front
-                        c.encode_utf8(&mut utf8_buf);
-                        // Slice disregards the unused portion of the buffer
-                        utf8_buf[..c.len_utf8()].iter().for_each(|byte| {
-                            // Convert byte to URL escape, e.g. %21 for b'!'
-                            let rem = *byte % 16;
-                            let right_char = to_hex_digit(rem);
-                            let left_char = to_hex_digit((*byte - rem) >> 4);
-                            resource.push('%');
-                            resource.push(left_char);
-                            resource.push(right_char);
-                        });
+                        for byte in c.encode_utf8(&mut [0u8; 4]).bytes() {
+                            write!(resource, "%{:02X}", byte).unwrap();
+                        }
                     }
                 },
             }
